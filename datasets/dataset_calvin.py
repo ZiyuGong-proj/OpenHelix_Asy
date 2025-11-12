@@ -10,6 +10,7 @@ from .dataset_engine import RLBenchDataset
 from .utils import Resize, TrajectoryInterpolator
 from utils.utils_with_calvin import to_relative_action, convert_rotation
 from .utils import loader
+from utils.instruction_utils import format_step_reasoning_prompt
 
 class CalvinDataset(RLBenchDataset):
 
@@ -171,7 +172,12 @@ class CalvinDataset(RLBenchDataset):
             # import pdb; pdb.set_trace()
             instr = torch.as_tensor(self._instructions[instr_ind])
             instr = instr.repeat(len(rgbs), 1, 1)
-            instr_text = [self._instructions_text[instr_ind].rstrip('.') for _ in frame_ids]
+            instr_text = [
+                format_step_reasoning_prompt(
+                    self._instructions_text[instr_ind], frame_idx
+                )
+                for frame_idx, _ in enumerate(frame_ids)
+            ]
             # print("text为", instr_text)
             # import pdb; pdb.set_trace()
         else:

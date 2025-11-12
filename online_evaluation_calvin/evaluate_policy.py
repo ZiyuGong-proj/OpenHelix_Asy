@@ -29,6 +29,7 @@ from online_evaluation_calvin.evaluate_utils import (
 )
 from online_evaluation_calvin.multistep_sequences import get_sequences
 from online_evaluation_calvin.evaluate_utils import get_env
+from utils.instruction_utils import append_reasoning_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +182,7 @@ def evaluate_sequence(env, model, task_checker, initial_state, eval_sequence,
     success_counter, video_aggregators = 0, []
     for subtask in eval_sequence:
         # get lang annotation for subtask
-        lang_annotation = val_annotations[subtask][0]
+        lang_annotation = append_reasoning_suffix(val_annotations[subtask][0])
         success, video = rollout(env, model, task_checker,
                                  subtask, lang_annotation)
         video_aggregators.append(video)
