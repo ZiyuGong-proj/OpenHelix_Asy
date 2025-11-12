@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
+from utils.nvtx_utils import nvtx_range
+
 
 from peft import LoraConfig, get_peft_model
 from model.llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM, LlavaLlamaModel)
@@ -87,28 +89,30 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         
         seg_token_mask = torch.cat([torch.zeros((seg_token_mask.shape[0], 256)).bool().cuda(), seg_token_mask], dim=1,) #[bs, 255+sequence_length] 255+82=337
         
-        output = super().forward(
-            images=images_clip,
-            attention_mask=attention_masks,
-            input_ids=input_ids,
-            output_hidden_states=True,
-        )
-        
-        output_hidden_states = output.hidden_states 
+        with nvtx_range("VLM:prefilling"):
+            output = super().forward(
+                images=images_clip,
+                attention_mask=attention_masks,
+                input_ids=input_ids,
+                output_hidden_states=True,
+            )
 
-        hidden_states = []
+        with nvtx_range("VLM:decoding"):
+            output_hidden_states = output.hidden_states
 
-        assert len(self.model.text_hidden_fcs) == 1
-        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1].float()))
-        action_latents = self.model.pred_act_mlps(output_hidden_states[-1][seg_token_mask].float())
-        pos_pred = self.model.pred_pos_act(action_latents)
-        rot_pred = self.model.pred_rot_act(action_latents)
-        gripper_pred = self.model.pred_gripper_act(action_latents)
-        act_pred = torch.cat([pos_pred,rot_pred,gripper_pred],dim=-1)
+            hidden_states = []
 
-        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            assert len(self.model.text_hidden_fcs) == 1
+            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1].float()))
+            action_latents = self.model.pred_act_mlps(output_hidden_states[-1][seg_token_mask].float())
+            pos_pred = self.model.pred_pos_act(action_latents)
+            rot_pred = self.model.pred_rot_act(action_latents)
+            gripper_pred = self.model.pred_gripper_act(action_latents)
+            act_pred = torch.cat([pos_pred,rot_pred,gripper_pred],dim=-1)
 
-        pred_embeddings = last_hidden_state[seg_token_mask]
+            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+
+            pred_embeddings = last_hidden_state[seg_token_mask]
         ce_loss = 0
         
         return pred_embeddings, ce_loss, act_pred
@@ -124,18 +128,20 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
             seg_token_mask = torch.cat([torch.zeros((seg_token_mask.shape[0], 256)).bool().cuda(), seg_token_mask], dim=1,) #[bs, 255+sequence_length] 255+82=337
             
-            output = super().forward(
-            images=images_clip,
-            attention_mask=attention_masks,
-            input_ids=input_ids,
-            output_hidden_states=True)
-            output_hidden_states = output.hidden_states
-            hidden_states = []
-            
-            assert len(self.model.text_hidden_fcs) == 1
-            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
-            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-            pred_embeddings = last_hidden_state[seg_token_mask]
+            with nvtx_range("VLM:prefilling"):
+                output = super().forward(
+                    images=images_clip,
+                    attention_mask=attention_masks,
+                    input_ids=input_ids,
+                    output_hidden_states=True)
+            with nvtx_range("VLM:decoding"):
+                output_hidden_states = output.hidden_states
+                hidden_states = []
+
+                assert len(self.model.text_hidden_fcs) == 1
+                hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
+                last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+                pred_embeddings = last_hidden_state[seg_token_mask]
         
         return None, pred_embeddings
 

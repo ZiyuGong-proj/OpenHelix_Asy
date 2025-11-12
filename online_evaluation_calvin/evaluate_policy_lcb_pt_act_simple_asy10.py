@@ -53,6 +53,7 @@ from datasets.calvin_dataset import transfer
 from torchvision import transforms
 from PIL import Image
 import json
+from utils.nvtx_utils import nvtx_range
 logger = logging.getLogger(__name__)
 
 EP_LEN = 60
@@ -310,7 +311,8 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
                 raise RuntimeError(f"Mismatched step indices: expected {step}, got {step_idx}")
 
             with torch.cuda.amp.autocast():
-                trajectory = model.step(obs, lang_embeddings)
+                with nvtx_range("Action Policy"):
+                    trajectory = model.step(obs, lang_embeddings)
 
             for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
                 curr_action = [
