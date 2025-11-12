@@ -15,6 +15,8 @@ import torch
 import numpy as np
 import yaml
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 from utils.common_utils import get_gripper_loc_bounds
 from online_evaluation_calvin.evaluate_model_act import create_model
@@ -106,6 +108,38 @@ class Arguments(tap.Tap):
     vision_tower: str = "/clip-vit-large-patch14"
     llm_ckpt: str = ''
     
+
+@contextmanager
+def nvtx_range(name: str):
+    if torch.cuda.is_available():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
+
+
+def _normalize_static_rgb(image: np.ndarray) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    if image.max() > 1.0:
+        image = image / 255.0
+    return np.clip(image, 0.0, 1.0)
+
+
+def compute_lang_embeddings(image_tensor, conversations, clip_image_processor, tokenizer, LLM_model):
+    image_tensor = _normalize_static_rgb(image_tensor)
+    image_tensor = np.ascontiguousarray(image_tensor)
+    image_clip, input_ids, attention_masks, _ = input_processing_real_batch(
+        image_tensor=image_tensor,
+        conv_list=conversations,
+        clip_image_processor=clip_image_processor,
+        tokenizer=tokenizer,
+    )
+    _, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)
+    return pred_embeddings.unsqueeze(0)
+
 
 def make_env(dataset_path, show_gui=True, split="validation", scene=None):
     val_folder = Path(dataset_path) / f"{split}"
@@ -254,62 +288,71 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
     pbar = tqdm(range(EP_LEN))
     LLM_model.eval()
 
-    for step in pbar:
-        obs = prepare_visual_states(obs, env)
-        obs = prepare_proprio_states(obs, env)
-        
-        # import pdb; pdb.set_trace()
-        #lang_annotation='push the sliding door to the right side'
-        text_list = [lang_annotation]
-        # import pdb; pdb.set_trace()
-        conversations, questions = transfer(text_list)
-        # convs_select = conversations[0]
-        #img:array(200, 200, 3)这个后面扩充了第0维度 conv:list，长度与img的batch一致
-        #"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <im_start><image><im_end>\nCan you control the robot to push the sliding door to the right side? ASSISTANT: Sure, I will push the sliding door to the right side <ACT>.</s>"
-        image_clip, input_ids, attention_masks, targets = input_processing_real_batch(image_tensor=obs["rgb_obs"]["rgb_static"], conv_list=conversations, clip_image_processor=clip_image_processor, tokenizer=tokenizer)
-        # import pdb; pdb.set_trace()
-        if step%1 == 0:
-            output_ids, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)#input_ids.size()=torch.Size([333, 3])
-            # latent_embs.append(pred_embeddings)
-            # lang_embeddings = pred_embeddings.unsqueeze(0)#[1, 512]-->[1, 1, 512]
-            lang_embeddings = pred_embeddings.unsqueeze(0)
-        # output_ids, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)#input_ids.size()=torch.Size([333, 3])
-        # print(pred_embeddings.shape)
-        # lang_embeddings = pred_embeddings.unsqueeze(0)#[1, 512]-->[1, 1, 512]
-        
-        # pred_embeddings为torch.Size([1, 512])
-        # output_ids = output_ids[0][output_ids[0] != -200]
-        # text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        # text_output = text_output.replace("\n", "").replace("  ", " ")
-        # print("text_output: ", text_output)
-        # print(pred_embeddings.shape)
-        
-        # lang_embeddings = model.encode_instruction(lang_annotation, model.args.device)#[1, 16, 512]
-        #torch.Size([1, 16, 512])
-        with torch.cuda.amp.autocast():
-            trajectory = model.step(obs, lang_embeddings)
-        for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
-            # calvin_env executes absolute action in the format of:
-            # [[x, y, z], [euler_x, euler_y, euler_z], [open]]
-            curr_action = [
-                trajectory[0, act_ind, :3],
-                trajectory[0, act_ind, 3:6],
-                trajectory[0, act_ind, [6]]
-            ]
-            pbar.set_description(f"step: {step}")
-            curr_proprio = obs['proprio']
-            obs, _, _, current_info = env.step(curr_action)
-            obs['proprio'] = curr_proprio
+    text_list = [lang_annotation]
+    conversations, _ = transfer(text_list)
+    obs = prepare_visual_states(obs, env)
+    obs = prepare_proprio_states(obs, env)
+    lang_embeddings = compute_lang_embeddings(obs["rgb_obs"]["rgb_static"], conversations, clip_image_processor, tokenizer, LLM_model)
 
-            # check if current step solves a task
-            current_task_info = task_oracle.get_task_info_for_set(
-                start_info, current_info, {subtask}
-            )
+    executor = ThreadPoolExecutor(max_workers=2)
+    next_embeddings_future = None
 
-            video.append(obs["rgb_obs"]["rgb_static"])
+    try:
+        for step in pbar:
+            with nvtx_range("Action Planning"):
+                with torch.cuda.amp.autocast():
+                    trajectory = model.step(obs, lang_embeddings)
 
-            if len(current_task_info) > 0:
-                return True, video
+            with nvtx_range("Action Execution"):
+                for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
+                    curr_action = [
+                        trajectory[0, act_ind, :3],
+                        trajectory[0, act_ind, 3:6],
+                        trajectory[0, act_ind, [6]]
+                    ]
+                    pbar.set_description(f"step: {step}")
+                    curr_proprio = obs['proprio']
+                    obs, _, _, current_info = env.step(curr_action)
+                    obs['proprio'] = curr_proprio
+
+                    if next_embeddings_future is not None and not next_embeddings_future.done():
+                        next_embeddings_future.cancel()
+                    next_embeddings_future = executor.submit(
+                        compute_lang_embeddings,
+                        obs["rgb_obs"]["rgb_static"],
+                        conversations,
+                        clip_image_processor,
+                        tokenizer,
+                        LLM_model,
+                    )
+
+                    current_task_info = task_oracle.get_task_info_for_set(
+                        start_info, current_info, {subtask}
+                    )
+
+                    video.append(obs["rgb_obs"]["rgb_static"])
+
+                    if len(current_task_info) > 0:
+                        if next_embeddings_future is not None:
+                            next_embeddings_future.cancel()
+                        return True, video
+
+            if next_embeddings_future is not None:
+                lang_embeddings = next_embeddings_future.result()
+                next_embeddings_future = None
+            else:
+                lang_embeddings = compute_lang_embeddings(
+                    obs["rgb_obs"]["rgb_static"],
+                    conversations,
+                    clip_image_processor,
+                    tokenizer,
+                    LLM_model,
+                )
+            obs = prepare_visual_states(obs, env)
+            obs = prepare_proprio_states(obs, env)
+
+    finally:
+        executor.shutdown(wait=True)
 
     return False, video
 
