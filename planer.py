@@ -86,6 +86,22 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             tokens_cpu = prediction_ids.detach().cpu()
             mask_cpu = mask.detach().bool().cpu()
 
+        if mask_cpu.shape != tokens_cpu.shape:
+            # Align the mask to the token tensor by truncating or padding with
+            # ``False`` values.  Some training setups only produce supervision
+            # for the response portion of the sequence, leading to label
+            # tensors that are shorter than the model's decoded output.  The
+            # logging path should remain robust in those cases instead of
+            # raising a shape mismatch error.
+            if mask_cpu.shape[-1] > tokens_cpu.shape[-1]:
+                mask_cpu = mask_cpu[..., : tokens_cpu.shape[-1]]
+            else:
+                pad_width = tokens_cpu.shape[-1] - mask_cpu.shape[-1]
+                if pad_width:
+                    pad_shape = list(mask_cpu.shape[:-1]) + [pad_width]
+                    pad_tensor = torch.zeros(pad_shape, dtype=torch.bool)
+                    mask_cpu = torch.cat([mask_cpu, pad_tensor], dim=-1)
+
         for idx in range(tokens_cpu.size(0)):
             active_mask = mask_cpu[idx]
             if not active_mask.any():
