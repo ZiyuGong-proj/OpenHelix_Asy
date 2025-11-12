@@ -50,7 +50,7 @@ from model.llava import conversation as conversation_lib
 from model.llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM, LlavaLlamaModel)
 from planer import LISAForCausalLM
 from datasets.calvin_dataset import transfer
-from utils.instruction_utils import append_reasoning_suffix
+from utils.instruction_utils import append_reasoning_suffix, format_step_reasoning_prompt
 from torchvision import transforms
 from PIL import Image
 import json
@@ -259,9 +259,6 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
     pbar = tqdm(range(EP_LEN))
     LLM_model.eval()
 
-    text_list = [augmented_instruction]
-    conversations, _ = transfer(text_list)
-
     def preprocess_observation(current_obs):
         current_obs = prepare_visual_states(current_obs, env)
         current_obs = prepare_proprio_states(current_obs, env)
@@ -279,6 +276,10 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
                 break
             step_idx, rgb_static = item
             try:
+                step_instruction = format_step_reasoning_prompt(
+                    lang_annotation, step_idx
+                )
+                conversations, _ = transfer([step_instruction])
                 image_clip, input_ids, attention_masks, targets = input_processing_real_batch(
                     image_tensor=rgb_static,
                     conv_list=conversations,

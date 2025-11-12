@@ -24,3 +24,27 @@ def append_reasoning_suffix(text: str) -> str:
 
     return f"{stripped}{INSTRUCTION_REASONING_SUFFIX}"
 
+
+def format_step_reasoning_prompt(text: str, step_index: int) -> str:
+    """Add step-aware guidance so the VLM reasons about the current frame.
+
+    The helper preserves the standard reasoning suffix and adds an extra
+    sentence that explicitly requests frame-specific, step-by-step reasoning.
+    ``step_index`` is zero-based and converted to a human-readable index in the
+    resulting text.
+    """
+
+    augmented = append_reasoning_suffix(text)
+    step_number = step_index + 1
+
+    if augmented.endswith((".", "?", "!")):
+        separator = " "
+    else:
+        separator = ". "
+
+    return (
+        f"{augmented}{separator}"
+        f"Focus on the observation at step {step_number} and describe what you see. "
+        "Then reason step by step about the immediate action the robot should take based on this specific frame."
+    )
+
