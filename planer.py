@@ -117,6 +117,55 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             print(f"[{prefix}][Sample {idx}] Output: {decoded_text}")
             print(f"[{prefix}][Sample {idx}] Token count: {token_count}")
 
+    def _log_vlm_generated_outputs(
+        self,
+        tokenizer,
+        input_ids,
+        attention_masks,
+        images,
+        prefix="VLM",
+    ):
+        if tokenizer is None or input_ids is None or attention_masks is None:
+            return
+
+        max_new_tokens = getattr(self.config, "logging_max_new_tokens", 128)
+
+        try:
+            generated = self.generate(
+                input_ids=input_ids,
+                attention_mask=attention_masks.long() if attention_masks is not None else None,
+                images=images,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=self.config.pad_token_id,
+                eos_token_id=self.config.eos_token_id,
+            )
+        except Exception as exc:  # pragma: no cover - logging path only
+            print(f"[{prefix}] Failed to generate VLM response: {exc}")
+            return
+
+        if generated.size(-1) <= input_ids.size(-1):
+            print(f"[{prefix}] No generated tokens to log.")
+            return
+
+        response_tokens = generated[:, input_ids.size(-1) :]
+        response_mask = response_tokens.ne(tokenizer.pad_token_id)
+
+        if tokenizer.eos_token_id is not None:
+            eos_mask = response_tokens.eq(tokenizer.eos_token_id)
+            for row in range(response_tokens.size(0)):
+                eos_positions = torch.nonzero(eos_mask[row], as_tuple=False)
+                if eos_positions.numel() > 0:
+                    first_eos = eos_positions[0].item()
+                    response_mask[row, first_eos + 1 :] = False
+
+        self._log_vlm_outputs(
+            tokenizer,
+            response_tokens,
+            response_mask,
+            prefix=prefix,
+        )
+
     def model_forward(self,
         images_clip: torch.FloatTensor,
         input_ids: torch.LongTensor,
@@ -141,9 +190,15 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             predictions = output.logits.argmax(dim=-1)
             if labels is not None:
                 mask = labels.ne(IGNORE_INDEX)
+                self._log_vlm_outputs(tokenizer, predictions, mask)
             else:
-                mask = attention_masks
-            self._log_vlm_outputs(tokenizer, predictions, mask)
+                self._log_vlm_generated_outputs(
+                    tokenizer,
+                    input_ids,
+                    attention_masks,
+                    images_clip,
+                    prefix="VLM",
+                )
 
         with nvtx_range("VLM:decoding"):
             output_hidden_states = output.hidden_states
@@ -196,9 +251,20 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 predictions = output.logits.argmax(dim=-1)
                 if labels is not None:
                     mask = labels.ne(IGNORE_INDEX)
+                    self._log_vlm_outputs(
+                        tokenizer,
+                        predictions,
+                        mask,
+                        prefix="VLM-Eval",
+                    )
                 else:
-                    mask = attention_masks
-                self._log_vlm_outputs(tokenizer, predictions, mask, prefix="VLM-Eval")
+                    self._log_vlm_generated_outputs(
+                        tokenizer,
+                        input_ids,
+                        attention_masks,
+                        images_clip,
+                        prefix="VLM-Eval",
+                    )
 
             with nvtx_range("VLM:decoding"):
                 output_hidden_states = output.hidden_states
