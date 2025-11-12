@@ -10,6 +10,7 @@ from utils.nvtx_utils import nvtx_range
 
 from peft import LoraConfig, get_peft_model
 from model.llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM, LlavaLlamaModel)
+from model.llava.constants import IGNORE_INDEX
 from datasets.utils_llcb import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
 
@@ -77,6 +78,29 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             return super().forward(**kwargs)
         return self.model_forward(**kwargs)
 
+    def _log_vlm_outputs(self, tokenizer, prediction_ids, mask, prefix="VLM"):
+        if tokenizer is None or prediction_ids is None or mask is None:
+            return
+
+        with torch.no_grad():
+            tokens_cpu = prediction_ids.detach().cpu()
+            mask_cpu = mask.detach().bool().cpu()
+
+        for idx in range(tokens_cpu.size(0)):
+            active_mask = mask_cpu[idx]
+            if not active_mask.any():
+                decoded_text = ""
+                token_count = 0
+            else:
+                decoded_text = tokenizer.decode(
+                    tokens_cpu[idx][active_mask].tolist(),
+                    skip_special_tokens=True,
+                )
+                token_count = int(active_mask.sum().item())
+
+            print(f"[{prefix}][Sample {idx}] Output: {decoded_text}")
+            print(f"[{prefix}][Sample {idx}] Token count: {token_count}")
+
     def model_forward(self,
         images_clip: torch.FloatTensor,
         input_ids: torch.LongTensor,
@@ -96,6 +120,14 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 input_ids=input_ids,
                 output_hidden_states=True,
             )
+
+        if tokenizer is not None:
+            predictions = output.logits.argmax(dim=-1)
+            if labels is not None:
+                mask = labels.ne(IGNORE_INDEX)
+            else:
+                mask = attention_masks
+            self._log_vlm_outputs(tokenizer, predictions, mask)
 
         with nvtx_range("VLM:decoding"):
             output_hidden_states = output.hidden_states
@@ -121,19 +153,37 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         self,
         images_clip,
         input_ids,
-        attention_masks,
-        tokenizer=None
+        attention_masks=None,
+        tokenizer=None,
+        labels=None,
+        **kwargs,
     ):
         with torch.no_grad():
+            if attention_masks is None:
+                pad_token_id = tokenizer.pad_token_id if tokenizer is not None else self.config.pad_token_id
+                if pad_token_id is not None:
+                    attention_masks = input_ids.ne(pad_token_id)
+                else:
+                    attention_masks = torch.ones_like(input_ids, dtype=torch.bool)
+
             seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
             seg_token_mask = torch.cat([torch.zeros((seg_token_mask.shape[0], 256)).bool().cuda(), seg_token_mask], dim=1,) #[bs, 255+sequence_length] 255+82=337
-            
+
             with nvtx_range("VLM:prefilling"):
                 output = super().forward(
                     images=images_clip,
                     attention_mask=attention_masks,
                     input_ids=input_ids,
                     output_hidden_states=True)
+
+            if tokenizer is not None:
+                predictions = output.logits.argmax(dim=-1)
+                if labels is not None:
+                    mask = labels.ne(IGNORE_INDEX)
+                else:
+                    mask = attention_masks
+                self._log_vlm_outputs(tokenizer, predictions, mask, prefix="VLM-Eval")
+
             with nvtx_range("VLM:decoding"):
                 output_hidden_states = output.hidden_states
                 hidden_states = []
@@ -142,7 +192,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
                 hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
                 last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
                 pred_embeddings = last_hidden_state[seg_token_mask]
-        
+
         return None, pred_embeddings
 
 

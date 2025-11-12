@@ -50,6 +50,7 @@ from model.llava import conversation as conversation_lib
 from model.llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM, LlavaLlamaModel)
 from planer import LISAForCausalLM
 from datasets.calvin_dataset import transfer
+from utils.instruction_utils import append_reasoning_suffix
 from torchvision import transforms
 from PIL import Image
 import json
@@ -251,13 +252,14 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
     start_info = env.get_info()
 
     print('------------------------------')
-    print(f'task: {lang_annotation}')
+    augmented_instruction = append_reasoning_suffix(lang_annotation)
+    print(f'task: {augmented_instruction}')
     video.append(obs["rgb_obs"]["rgb_static"])
 
     pbar = tqdm(range(EP_LEN))
     LLM_model.eval()
 
-    text_list = [lang_annotation]
+    text_list = [augmented_instruction]
     conversations, _ = transfer(text_list)
 
     def preprocess_observation(current_obs):
@@ -277,14 +279,19 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
                 break
             step_idx, rgb_static = item
             try:
-                image_clip, input_ids, attention_masks, _ = input_processing_real_batch(
+                image_clip, input_ids, attention_masks, targets = input_processing_real_batch(
                     image_tensor=rgb_static,
                     conv_list=conversations,
                     clip_image_processor=clip_image_processor,
                     tokenizer=tokenizer,
                 )
                 with torch.no_grad():
-                    _, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)
+                    _, pred_embeddings = LLM_model.evaluate(
+                        image_clip,
+                        input_ids,
+                        attention_masks,
+                        tokenizer=tokenizer,
+                    )
                 lang_embeddings = pred_embeddings.unsqueeze(0)
                 embedding_queue.put((step_idx, lang_embeddings, None))
             except Exception as exc:

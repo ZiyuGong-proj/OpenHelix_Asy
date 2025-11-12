@@ -9,6 +9,7 @@ from calvin_agent.models.calvin_base_model import CalvinBaseModel
 # from diffuser_actor.trajectory_optimization.diffuser_actor import DiffuserActor
 from diffuser_actor import DiffuserActorACTS
 from online_evaluation_calvin.evaluate_utils import convert_action
+from utils.instruction_utils import append_reasoning_suffix
 from utils.utils_with_calvin import relative_to_absolute
 
 
@@ -122,7 +123,7 @@ class DiffusionModel(CalvinBaseModel):
         Returns:
             pred: a tensor of latent embeddings of shape (text_max_length, 512)
         """
-        instr = instruction + '.'
+        instr = append_reasoning_suffix(instruction) + '.'
         tokens = self.text_tokenizer(instr, padding="max_length")["input_ids"]
 
         tokens = torch.tensor(tokens).to(device)
