@@ -10,7 +10,7 @@ import math
 import warnings
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+"""
 import torch
 from transformers.models.bloom.modeling_bloom import (
     BaseModelOutputWithPastAndCrossAttentions, BloomForCausalLM, BloomModel,
@@ -29,6 +29,87 @@ from transformers.models.opt.modeling_opt import \
     _expand_mask as _expand_mask_opt
 from transformers.models.opt.modeling_opt import \
     _make_causal_mask as _make_causal_mask_opt
+"""
+import torch
+
+# 这些公共类在新版 HF 仍然存在，可以正常导入
+from transformers.models.bloom.modeling_bloom import (
+    BaseModelOutputWithPastAndCrossAttentions,
+    BloomForCausalLM,
+    BloomModel,
+    CausalLMOutputWithCrossAttentions,
+    CrossEntropyLoss,
+    logging,   # bloom 的 logger
+)
+from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
+from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoForCausalLM
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXForCausalLM
+from transformers.models.gptj.modeling_gptj import GPTJForCausalLM
+from transformers.models.opt.modeling_opt import OPTForCausalLM
+
+# ========= 兼容层：_expand_mask / _make_causal_mask =========
+# BLOOM: _expand_mask
+try:
+    from transformers.models.bloom.modeling_bloom import _expand_mask as _expand_mask_bloom  # type: ignore
+except Exception:
+    def _expand_mask_bloom(attention_mask: torch.Tensor, dtype: torch.dtype, tgt_len: int | None = None):
+        """
+        旧版 HF _expand_mask 的等价实现：
+        [B,S] 0/1 -> [B,1,1,S] 加性掩码，允许位置=0，屏蔽位置=-inf
+        """
+        bsz, src_len = attention_mask.shape
+        if tgt_len is None:
+            tgt_len = src_len
+        expanded = attention_mask[:, None, None, :].to(dtype)
+        expanded = (1.0 - expanded) * torch.finfo(dtype).min
+        return expanded
+
+# BLOOM: _make_causal_mask
+try:
+    from transformers.models.bloom.modeling_bloom import _make_causal_mask as _make_causal_mask_bloom  # type: ignore
+except Exception:
+    def _make_causal_mask_bloom(input_shape, dtype: torch.dtype, device=None, past_key_values_length: int = 0):
+        """
+        生成上三角因果掩码（加性形式），形状 [1,1,T,T(+past)]
+        """
+        bsz, tgt_len = input_shape
+        # 上三角（严格因果）：对角线上方为 True => 需要屏蔽
+        causal = torch.triu(torch.ones((tgt_len, tgt_len), device=device, dtype=torch.bool), diagonal=1)
+        if past_key_values_length > 0:
+            left = torch.ones((tgt_len, past_key_values_length), device=device, dtype=torch.bool)
+            causal = torch.cat([left, causal], dim=-1)
+        mask = causal.to(dtype)
+        mask = mask.masked_fill(causal, torch.finfo(dtype).min)  # True(屏蔽) -> -inf，False(允许) -> 0
+        return mask[None, None, :, :]
+
+# OPT: _expand_mask
+try:
+    from transformers.models.opt.modeling_opt import _expand_mask as _expand_mask_opt  # type: ignore
+except Exception:
+    def _expand_mask_opt(attention_mask: torch.Tensor, dtype: torch.dtype, tgt_len: int | None = None):
+        # 语义保持与 BLOOM 版本一致
+        bsz, src_len = attention_mask.shape
+        if tgt_len is None:
+            tgt_len = src_len
+        expanded = attention_mask[:, None, None, :].to(dtype)
+        expanded = (1.0 - expanded) * torch.finfo(dtype).min
+        return expanded
+
+# OPT: _make_causal_mask（一般用不到；若你的代码也用到了，再加一个同名兜底）
+try:
+    from transformers.models.opt.modeling_opt import _make_causal_mask as _make_causal_mask_opt  # type: ignore
+except Exception:
+    def _make_causal_mask_opt(input_shape, dtype: torch.dtype, device=None, past_key_values_length: int = 0):
+        bsz, tgt_len = input_shape
+        causal = torch.triu(torch.ones((tgt_len, tgt_len), device=device, dtype=torch.bool), diagonal=1)
+        if past_key_values_length > 0:
+            left = torch.ones((tgt_len, past_key_values_length), device=device, dtype=torch.bool)
+            causal = torch.cat([left, causal], dim=-1)
+        mask = causal.to(dtype)
+        mask = mask.masked_fill(causal, torch.finfo(dtype).min)
+        return mask[None, None, :, :]
+
+
 
 logger = logging.get_logger(__name__)
 _SUPPORTED_GPT_MODELS = (

@@ -22,8 +22,8 @@ from utils.utils_with_calvin import (
 class Arguments(tap.Tap):
     traj_len: int = 16
     execute_every: int = 4
-    save_path: str = './data/calvin/packaged_ABC_D'
-    root_dir: str = './calvin/dataset/task_ABC_D'
+    save_path: str = './nvmeroot/repos/calvin/dataset/packaged_debug'
+    root_dir: str = './nvmeroot/repos/calvin/dataset/calvin_debug_dataset'
     mode: str = 'keypose'  # [keypose, close_loop]
     tasks: Optional[List[str]] = None
     split: str = 'training'  # [training, validation]

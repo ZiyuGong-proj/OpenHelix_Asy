@@ -226,8 +226,9 @@ def get_env_state_for_initial_condition(initial_condition):
         np.array([2.29995412e-01, -1.19995140e-01, 4.59990010e-01]),
     ]
     # we want to have a "deterministic" random seed for each initial condition
-    import pyhash
-    hasher = pyhash.fnv1_32()
+    import xxhash
+    hasher = lambda s: xxhash.xxh32(s.encode("utf-8")).intdigest()
+    #hasher = pyhash.fnv1_32()
     seed = hasher(str(initial_condition.values()))
     with temp_seed(seed):
         np.random.shuffle(block_table)

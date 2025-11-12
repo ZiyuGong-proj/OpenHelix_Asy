@@ -63,7 +63,7 @@ class DiffusionModel(CalvinBaseModel):
             if encoder == "bert":
                 model = transformers.BertModel.from_pretrained("bert-base-uncased")
             elif encoder == "clip":
-                model = transformers.CLIPTextModel.from_pretrained("/dingpengxiang/clip-vit-large-patch14")
+                model = transformers.CLIPTextModel.from_pretrained("/nvmeroot/models/clip-vit-large-patch14")
             else:
                 raise ValueError(f"Unexpected encoder {encoder}")
             if not isinstance(model, transformers.PreTrainedModel):
@@ -76,7 +76,7 @@ class DiffusionModel(CalvinBaseModel):
                 tokenizer = transformers.BertTokenizer.from_pretrained("bert-base-uncased")
             elif encoder == "clip":
                 tokenizer = transformers.CLIPTokenizer.from_pretrained(
-                    "/dingpengxiang/clip-vit-large-patch14"
+                    "/nvmeroot/models/clip-vit-large-patch14"
                 )
             else:
                 raise ValueError(f"Unexpected encoder {encoder}")

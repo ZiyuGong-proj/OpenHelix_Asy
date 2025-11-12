@@ -163,5 +163,12 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         return model_inputs
 
 
-AutoConfig.register("llava", LlavaConfig)
+#AutoConfig.register("llava", LlavaConfig)
+from transformers import AutoConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+if "llava" not in CONFIG_MAPPING:
+    AutoConfig.register("llava", LlavaConfig)
+
+
 AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaForCausalLM)

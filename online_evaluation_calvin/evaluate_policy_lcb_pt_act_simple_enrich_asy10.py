@@ -54,7 +54,7 @@ import json
 logger = logging.getLogger(__name__)
 
 EP_LEN = 60
-NUM_SEQUENCES = 1000
+NUM_SEQUENCES = 100
 EXECUTE_LEN = 20
 
 
@@ -100,7 +100,8 @@ class Arguments(tap.Tap):
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,v_proj"
-    llava_dir: str = "/LLaVA-7B-Lightening-v1-1/LLaVA-7B-Lightening-v1-1/LLaVA-7B-Lightening-v1-1"
+    #llava_dir: str = "/LLaVA-7B-Lightening-v1-1/LLaVA-7B-Lightening-v1-1/LLaVA-7B-Lightening-v1-1"
+    llava_dir: str = "/nvmeroot/models/llava-7b-lightening-v1-1"
     vision_tower: str = "/clip-vit-large-patch14"
     llm_ckpt: str = ''
     
