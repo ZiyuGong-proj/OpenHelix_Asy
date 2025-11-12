@@ -8,6 +8,7 @@ import random
 import logging
 from pathlib import Path
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import tap
 import hydra
 from omegaconf import OmegaConf
@@ -255,64 +256,97 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
     pbar = tqdm(range(EP_LEN))
     LLM_model.eval()
 
-    for step in pbar:
-        obs = prepare_visual_states(obs, env)
-        obs = prepare_proprio_states(obs, env)
-        
-        # import pdb; pdb.set_trace()
-        #lang_annotation='push the sliding door to the right side'
-        text_list = [lang_annotation]
-        # import pdb; pdb.set_trace()
-        conversations, questions = transfer(text_list)
-        # convs_select = conversations[0]
-        # import pdb; pdb.set_trace()
-        #img:array(200, 200, 3)这个后面扩充了第0维度 conv:list，长度与img的batch一致
-        #"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <im_start><image><im_end>\nCan you control the robot to push the sliding door to the right side? ASSISTANT: Sure, I will push the sliding door to the right side <ACT>.</s>"
-        image_clip, input_ids, attention_masks, targets = input_processing_real_batch(image_tensor=obs["rgb_obs"]["rgb_static"], conv_list=conversations, clip_image_processor=clip_image_processor, tokenizer=tokenizer)
-        # print("此时占用了", torch.cuda.memory_summary())
-        # import pdb; pdb.set_trace()
-        if step%60 == 0:
-            output_ids, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)#input_ids.size()=torch.Size([333, 3])
-            # latent_embs.append(pred_embeddings)
-            lang_embeddings = pred_embeddings.unsqueeze(0)#[1, 512]-->[1, 1, 512]
-        # output_ids, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)#input_ids.size()=torch.Size([333, 3])
-        # print(pred_embeddings.shape)
-        # lang_embeddings = pred_embeddings.unsqueeze(0)#[1, 512]-->[1, 1, 512]
-        
-        # pred_embeddings为torch.Size([1, 512])
-        # output_ids = output_ids[0][output_ids[0] != -200]
-        # text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        # text_output = text_output.replace("\n", "").replace("  ", " ")
-        # print("text_output: ", text_output)
-        # print(pred_embeddings.shape)
-        
-        # lang_embeddings = model.encode_instruction(lang_annotation, model.args.device)#[1, 16, 512]
-        #torch.Size([1, 16, 512])
-        # import pdb; pdb.set_trace()
-        with torch.cuda.amp.autocast():
-            trajectory = model.step(obs, lang_embeddings)
-        for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
-            # calvin_env executes absolute action in the format of:
-            # [[x, y, z], [euler_x, euler_y, euler_z], [open]]
-            curr_action = [
-                trajectory[0, act_ind, :3],
-                trajectory[0, act_ind, 3:6],
-                trajectory[0, act_ind, [6]]
-            ]
-            pbar.set_description(f"step: {step}")
-            curr_proprio = obs['proprio']
-            obs, _, _, current_info = env.step(curr_action)
-            obs['proprio'] = curr_proprio
+    conversations, _ = transfer([lang_annotation])
 
-            # check if current step solves a task
-            current_task_info = task_oracle.get_task_info_for_set(
-                start_info, current_info, {subtask}
-            )
+    def build_llm_inputs(processed_obs):
+        image_clip, input_ids, attention_masks, _ = input_processing_real_batch(
+            image_tensor=processed_obs["rgb_obs"]["rgb_static"],
+            conv_list=conversations,
+            clip_image_processor=clip_image_processor,
+            tokenizer=tokenizer,
+        )
+        return image_clip, input_ids, attention_masks
 
-            video.append(obs["rgb_obs"]["rgb_static"])
+    def run_llm_evaluate(image_clip, input_ids, attention_masks):
+        device = image_clip.device
+        if device.type == "cuda" and device.index is not None:
+            torch.cuda.set_device(device.index)
+        with torch.no_grad():
+            _, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)
+        return pred_embeddings.unsqueeze(0)
 
-            if len(current_task_info) > 0:
-                return True, video
+    EMBEDDING_TIMEOUT_S = 0.05
+    executor = ThreadPoolExecutor(max_workers=2)
+    pending_future = None
+    last_embedding = None
+
+    processed_obs = prepare_visual_states(obs, env)
+    processed_obs = prepare_proprio_states(processed_obs, env)
+    image_clip, input_ids, attention_masks = build_llm_inputs(processed_obs)
+    pending_future = executor.submit(run_llm_evaluate, image_clip, input_ids, attention_masks)
+
+    try:
+        for step in pbar:
+            lang_embeddings = None
+            fallback_future = None
+            try:
+                lang_embeddings = pending_future.result(timeout=EMBEDDING_TIMEOUT_S)
+                last_embedding = lang_embeddings
+            except TimeoutError:
+                fallback_future = pending_future
+                if last_embedding is not None:
+                    print("LLM embedding not ready; using last embedding as fallback.")
+                    lang_embeddings = last_embedding
+                else:
+                    print("LLM embedding not ready; waiting synchronously for result.")
+                    lang_embeddings = pending_future.result()
+                    last_embedding = lang_embeddings
+            except Exception as exc:
+                print(f"LLM evaluation failed with error {exc}; using last embedding if available.")
+                if last_embedding is not None:
+                    lang_embeddings = last_embedding
+                else:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+            finally:
+                if fallback_future is not None and fallback_future.done():
+                    try:
+                        last_embedding = fallback_future.result()
+                    except Exception:
+                        pass
+                pending_future = None
+
+            with torch.cuda.amp.autocast():
+                trajectory = model.step(processed_obs, lang_embeddings)
+            for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
+                # calvin_env executes absolute action in the format of:
+                # [[x, y, z], [euler_x, euler_y, euler_z], [open]]
+                curr_action = [
+                    trajectory[0, act_ind, :3],
+                    trajectory[0, act_ind, 3:6],
+                    trajectory[0, act_ind, [6]]
+                ]
+                pbar.set_description(f"step: {step}")
+                curr_proprio = processed_obs['proprio']
+                obs, _, _, current_info = env.step(curr_action)
+                obs['proprio'] = curr_proprio
+
+                # check if current step solves a task
+                current_task_info = task_oracle.get_task_info_for_set(
+                    start_info, current_info, {subtask}
+                )
+
+                video.append(obs["rgb_obs"]["rgb_static"])
+
+                if len(current_task_info) > 0:
+                    return True, video
+
+            processed_obs = prepare_visual_states(obs, env)
+            processed_obs = prepare_proprio_states(processed_obs, env)
+            image_clip, input_ids, attention_masks = build_llm_inputs(processed_obs)
+            pending_future = executor.submit(run_llm_evaluate, image_clip, input_ids, attention_masks)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     return False, video
 
