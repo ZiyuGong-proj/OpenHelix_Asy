@@ -15,6 +15,8 @@ import torch
 import numpy as np
 import yaml
 from tqdm import tqdm
+from queue import Queue
+from threading import Thread
 
 from utils.common_utils import get_gripper_loc_bounds
 from online_evaluation_calvin.evaluate_model_act import create_model
@@ -51,6 +53,7 @@ from datasets.calvin_dataset import transfer
 from torchvision import transforms
 from PIL import Image
 import json
+from utils.nvtx_utils import nvtx_range
 logger = logging.getLogger(__name__)
 
 EP_LEN = 60
@@ -255,64 +258,97 @@ def rollout(env, model, LLM_model, clip_image_processor, tokenizer, task_oracle,
     pbar = tqdm(range(EP_LEN))
     LLM_model.eval()
 
-    for step in pbar:
-        obs = prepare_visual_states(obs, env)
-        obs = prepare_proprio_states(obs, env)
-        
-        # import pdb; pdb.set_trace()
-        #lang_annotation='push the sliding door to the right side'
-        text_list = [lang_annotation]
-        # import pdb; pdb.set_trace()
-        conversations, questions = transfer(text_list)
-        # convs_select = conversations[0]
-        # import pdb; pdb.set_trace()
-        #img:array(200, 200, 3)这个后面扩充了第0维度 conv:list，长度与img的batch一致
-        #"A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: <im_start><image><im_end>\nCan you control the robot to push the sliding door to the right side? ASSISTANT: Sure, I will push the sliding door to the right side <ACT>.</s>"
-        image_clip, input_ids, attention_masks, targets = input_processing_real_batch(image_tensor=obs["rgb_obs"]["rgb_static"], conv_list=conversations, clip_image_processor=clip_image_processor, tokenizer=tokenizer)
-        # print("此时占用了", torch.cuda.memory_summary())
-        # import pdb; pdb.set_trace()
-        if step%60 == 0:
-            output_ids, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)#input_ids.size()=torch.Size([333, 3])
-            # latent_embs.append(pred_embeddings)
-            lang_embeddings = pred_embeddings.unsqueeze(0)#[1, 512]-->[1, 1, 512]
-        # output_ids, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)#input_ids.size()=torch.Size([333, 3])
-        # print(pred_embeddings.shape)
-        # lang_embeddings = pred_embeddings.unsqueeze(0)#[1, 512]-->[1, 1, 512]
-        
-        # pred_embeddings为torch.Size([1, 512])
-        # output_ids = output_ids[0][output_ids[0] != -200]
-        # text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-        # text_output = text_output.replace("\n", "").replace("  ", " ")
-        # print("text_output: ", text_output)
-        # print(pred_embeddings.shape)
-        
-        # lang_embeddings = model.encode_instruction(lang_annotation, model.args.device)#[1, 16, 512]
-        #torch.Size([1, 16, 512])
-        # import pdb; pdb.set_trace()
-        with torch.cuda.amp.autocast():
-            trajectory = model.step(obs, lang_embeddings)
-        for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
-            # calvin_env executes absolute action in the format of:
-            # [[x, y, z], [euler_x, euler_y, euler_z], [open]]
-            curr_action = [
-                trajectory[0, act_ind, :3],
-                trajectory[0, act_ind, 3:6],
-                trajectory[0, act_ind, [6]]
-            ]
-            pbar.set_description(f"step: {step}")
-            curr_proprio = obs['proprio']
-            obs, _, _, current_info = env.step(curr_action)
-            obs['proprio'] = curr_proprio
+    text_list = [lang_annotation]
+    conversations, _ = transfer(text_list)
 
-            # check if current step solves a task
-            current_task_info = task_oracle.get_task_info_for_set(
-                start_info, current_info, {subtask}
-            )
+    def preprocess_observation(current_obs):
+        current_obs = prepare_visual_states(current_obs, env)
+        current_obs = prepare_proprio_states(current_obs, env)
+        return current_obs
 
-            video.append(obs["rgb_obs"]["rgb_static"])
+    obs_queue: Queue = Queue(maxsize=2)
+    embedding_queue: Queue = Queue(maxsize=2)
 
-            if len(current_task_info) > 0:
-                return True, video
+    def llm_worker():
+        while True:
+            item = obs_queue.get()
+            if item is None:
+                embedding_queue.put((None, None, None))
+                obs_queue.task_done()
+                break
+            step_idx, rgb_static = item
+            try:
+                image_clip, input_ids, attention_masks, _ = input_processing_real_batch(
+                    image_tensor=rgb_static,
+                    conv_list=conversations,
+                    clip_image_processor=clip_image_processor,
+                    tokenizer=tokenizer,
+                )
+                with torch.no_grad():
+                    _, pred_embeddings = LLM_model.evaluate(image_clip, input_ids, attention_masks)
+                lang_embeddings = pred_embeddings.unsqueeze(0)
+                embedding_queue.put((step_idx, lang_embeddings, None))
+            except Exception as exc:
+                embedding_queue.put((step_idx, None, exc))
+            finally:
+                obs_queue.task_done()
+
+    llm_thread = Thread(target=llm_worker, daemon=True)
+    llm_thread.start()
+
+    obs = preprocess_observation(obs)
+    obs_queue.put((0, np.copy(obs["rgb_obs"]["rgb_static"])))
+
+    success = False
+
+    try:
+        for step in pbar:
+            step_idx, lang_embeddings, error = embedding_queue.get()
+            if step_idx is None:
+                break
+            if error is not None:
+                raise error
+            if step_idx != step:
+                raise RuntimeError(f"Mismatched step indices: expected {step}, got {step_idx}")
+
+            with torch.cuda.amp.autocast():
+                with nvtx_range("Action Policy"):
+                    trajectory = model.step(obs, lang_embeddings)
+
+            for act_ind in range(min(trajectory.shape[1], EXECUTE_LEN)):
+                curr_action = [
+                    trajectory[0, act_ind, :3],
+                    trajectory[0, act_ind, 3:6],
+                    trajectory[0, act_ind, [6]]
+                ]
+                pbar.set_description(f"step: {step}")
+                curr_proprio = obs['proprio']
+                obs, _, _, current_info = env.step(curr_action)
+                obs['proprio'] = curr_proprio
+
+                current_task_info = task_oracle.get_task_info_for_set(
+                    start_info, current_info, {subtask}
+                )
+
+                video.append(obs["rgb_obs"]["rgb_static"])
+
+                if len(current_task_info) > 0:
+                    success = True
+                    break
+
+            if success:
+                break
+
+            if step + 1 < EP_LEN:
+                obs = preprocess_observation(obs)
+                obs_queue.put((step + 1, np.copy(obs["rgb_obs"]["rgb_static"])))
+    finally:
+        obs_queue.put(None)
+        obs_queue.join()
+        llm_thread.join()
+
+    if success:
+        return True, video
 
     return False, video
 
